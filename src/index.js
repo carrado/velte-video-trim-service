@@ -2,31 +2,33 @@ import { mkdirSync } from "fs";
 import express from "express";
 import cors from "cors";
 import { env } from "./env.js";
-import { createTusServer, jobStatusHandler } from "./uploadsRouter.js";
+import { initUpload, completeUpload } from "./multipartRouter.js";
+import { jobStatusHandler } from "./jobsRouter.js";
+import { cancelUpload } from "./cancelRouter.js";
 
 mkdirSync(env.uploadDir, { recursive: true });
 
 const app = express();
 
-// Only the Velte app's own origin may start an upload here — this service
-// holds no user-facing auth of its own beyond the per-job bearer token,
-// which is enough to stop random internet POSTs but CORS keeps it from
-// being embeddable/callable from anywhere else in a browser context too.
+// Only the Velte app's own origin may call THIS service's routes — video
+// bytes themselves no longer pass through here at all (they go browser -> R2
+// directly against presigned URLs, see multipartRouter.js), so this only
+// ever needs to gate small JSON requests: minting an upload job, completing
+// it, and status polls.
 app.use(
   cors({
     origin: env.appOrigin,
-    methods: ["GET", "POST", "PATCH", "HEAD", "OPTIONS", "DELETE"],
-    allowedHeaders: ["Authorization", "Content-Type", "Tus-Resumable", "Upload-Length", "Upload-Metadata", "Upload-Offset"],
-    exposedHeaders: ["Location", "Upload-Offset", "Tus-Resumable", "Tus-Version", "Tus-Max-Size"],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Authorization", "Content-Type"],
   }),
 );
+app.use(express.json());
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const tusServer = createTusServer();
-app.all("/uploads", tusServer.handle.bind(tusServer));
-app.all("/uploads/*", tusServer.handle.bind(tusServer));
-
+app.post("/uploads/init", initUpload);
+app.post("/uploads/complete", completeUpload);
+app.post("/uploads/cancel", cancelUpload);
 app.get("/jobs/:id", jobStatusHandler);
 
 app.listen(env.port, () => {

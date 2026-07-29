@@ -1,16 +1,17 @@
 import "dotenv/config";
 import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { existsSync, openSync, readSync, closeSync, statSync } from "node:fs";
 import { SignJWT } from "jose";
-import { Upload } from "tus-js-client";
 
 // Fires N concurrent "vendor trims" at a real (local or deployed) instance
 // of this service, to find MAX_CONCURRENT_JOBS's actual ceiling instead of
 // guessing. Signs tokens locally with TRIM_SERVICE_JWT_SECRET rather than
 // going through Velte's /api/videos/trim-auth — that route is a trivial
 // Next.js handler, not what we're trying to stress-test here; this exercises
-// exactly the component in question (uploads.js + queue.js + ffmpeg +
-// bunnyPush.js) the same way the real flow would.
+// exactly the component in question (multipartRouter.js + queue.js +
+// ffmpeg + bunnyPush.js) the same way the real flow would: parallel
+// presigned-part PUTs straight to R2, then /uploads/complete, then polling
+// GET /jobs/:id the same way videoTrim.ts does.
 //
 // Usage:
 //   npm run load-test -- --file ./sample-large.mp4 --concurrency 23 --url http://localhost:8787
@@ -47,51 +48,92 @@ async function signToken(jobId) {
     .sign(secret());
 }
 
-function runOneJob({ index, baseUrl, filePath, endS }) {
+// Reads one part's bytes synchronously off disk — fine for a load-testing
+// script (not the real client, see videoTrim.ts for the browser's actual
+// File.slice()-based version), simplest thing that produces the right
+// bytes per part without pulling in a stream-slicing dependency here.
+function readPart(fd, start, length) {
+  const buf = Buffer.alloc(length);
+  const read = readSync(fd, buf, 0, length, start);
+  return read === length ? buf : buf.subarray(0, read);
+}
+
+async function runOneJob({ index, baseUrl, filePath, endS }) {
   const jobId = randomUUID();
   const startedAt = Date.now();
-  const timings = { uploadMs: null, totalMs: null };
+  const fileSize = statSync(filePath).size;
 
-  return signToken(jobId).then(
-    (token) =>
-      new Promise((resolve) => {
-        const upload = new Upload(createReadStream(filePath), {
-          endpoint: `${baseUrl}/uploads`,
-          uploadSize: statSync(filePath).size,
-          headers: { Authorization: `Bearer ${token}` },
-          retryDelays: [0, 3000, 5000],
-          metadata: {
-            jobId,
-            startS: "0",
-            endS: String(endS),
-            filename: "sample-large.mp4",
-            filetype: "video/mp4",
-          },
-          onError: (err) =>
-            resolve({ index, jobId, ok: false, stage: "upload", error: String(err) }),
-          onSuccess: async () => {
-            timings.uploadMs = Date.now() - startedAt;
-            const deadline = Date.now() + 5 * 60 * 1000;
-            while (Date.now() < deadline) {
-              const res = await fetch(`${baseUrl}/jobs/${jobId}`).catch(() => null);
-              if (res?.ok) {
-                const job = await res.json();
-                if (job.status === "done") {
-                  timings.totalMs = Date.now() - startedAt;
-                  return resolve({ index, jobId, ok: true, timings, bunnyUrl: job.bunnyUrl });
-                }
-                if (job.status === "error") {
-                  return resolve({ index, jobId, ok: false, stage: "process", error: job.error });
-                }
-              }
-              await new Promise((r) => setTimeout(r, 1500));
-            }
-            resolve({ index, jobId, ok: false, stage: "process", error: "timed out polling" });
-          },
-        });
-        upload.start();
+  try {
+    const token = await signToken(jobId);
+    const authHeaders = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    const initRes = await fetch(`${baseUrl}/uploads/init`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        contentType: "video/mp4",
+        fileSize,
+        startS: 0,
+        endS,
       }),
-  );
+    });
+    if (!initRes.ok) {
+      return { index, jobId, ok: false, stage: "init", error: `HTTP ${initRes.status}` };
+    }
+    const { partSize, parts } = await initRes.json();
+
+    const fd = openSync(filePath, "r");
+    const uploadedParts = await Promise.all(
+      parts.map(async ({ partNumber, url }) => {
+        const start = (partNumber - 1) * partSize;
+        const length = Math.min(partSize, fileSize - start);
+        const body = readPart(fd, start, length);
+        const res = await fetch(url, { method: "PUT", body });
+        if (!res.ok) throw new Error(`part ${partNumber} failed: HTTP ${res.status}`);
+        const etag = res.headers.get("ETag");
+        if (!etag) throw new Error(`part ${partNumber} response missing ETag (check R2 CORS ExposeHeaders)`);
+        return { partNumber, etag };
+      }),
+    );
+    closeSync(fd);
+    const uploadMs = Date.now() - startedAt;
+
+    const completeRes = await fetch(`${baseUrl}/uploads/complete`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ parts: uploadedParts }),
+    });
+    if (!completeRes.ok) {
+      return { index, jobId, ok: false, stage: "complete", error: `HTTP ${completeRes.status}` };
+    }
+
+    const deadline = Date.now() + 5 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const res = await fetch(`${baseUrl}/jobs/${jobId}`).catch(() => null);
+      if (res?.ok) {
+        const job = await res.json();
+        if (job.status === "done") {
+          return {
+            index,
+            jobId,
+            ok: true,
+            timings: { uploadMs, totalMs: Date.now() - startedAt },
+            videoUrl: job.videoUrl,
+          };
+        }
+        if (job.status === "error") {
+          return { index, jobId, ok: false, stage: "process", error: job.error };
+        }
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    return { index, jobId, ok: false, stage: "process", error: "timed out polling" };
+  } catch (err) {
+    return { index, jobId, ok: false, stage: "upload", error: String(err) };
+  }
 }
 
 async function main() {
@@ -131,7 +173,7 @@ async function main() {
   if (totals.length) {
     const avg = totals.reduce((a, b) => a + b, 0) / totals.length;
     console.log(
-      `Per-job time (upload finish → trimmed on Bunny): min ${(totals[0] / 1000).toFixed(1)}s, ` +
+      `Per-job time (upload start → trimmed clip live on R2): min ${(totals[0] / 1000).toFixed(1)}s, ` +
         `avg ${(avg / 1000).toFixed(1)}s, max ${(totals[totals.length - 1] / 1000).toFixed(1)}s`,
     );
   }

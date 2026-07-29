@@ -4,13 +4,12 @@ import { env } from "./env.js";
 // R2 speaks the S3 API, so the standard AWS SDK works against it unchanged
 // once pointed at R2's endpoint — no Cloudflare-specific SDK needed.
 //
-// Exported as both a raw config AND a built client, because the two
-// consumers need different shapes: @tus/s3-store's S3Store (used in
-// uploadsRouter.js) builds its OWN internal S3 client from a config object
-// — it does NOT accept a pre-built client instance (confirmed against the
-// installed package's source, not just its types) — while processJob.js's
-// direct GetObject/DeleteObject calls need an actual client to call
-// `.send()` on.
+// r2ClientConfig is exported alongside the built client mostly for
+// completeness — every current consumer (multipartRouter.js's
+// CreateMultipartUpload/UploadPart/CompleteMultipartUpload,
+// processJob.js's GetObject/DeleteObject, both via @aws-sdk/s3-request-
+// presigner for presigned URLs) just calls `.send()`/`getSignedUrl()` on
+// the built `s3Client` below.
 export const r2ClientConfig = {
   region: "auto",
   endpoint: `https://${env.r2AccountId}.r2.cloudflarestorage.com`,

@@ -10,13 +10,11 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.658.0",
-    "@tus/s3-store": "^1.6.0",
-    "@tus/server": "^1.9.0",
+    "@aws-sdk/s3-request-presigner": "^3.1097.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "jose": "^6.2.2",
-    "tus-js-client": "^4.3.1"
+    "jose": "^6.2.2"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"

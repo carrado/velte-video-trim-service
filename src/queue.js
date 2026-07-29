@@ -1,8 +1,8 @@
 import { env } from "./env.js";
 
-// Bounds how many trim+push-to-Bunny pipelines run at once — NOT the
-// uploads. Every vendor's upload starts immediately and streams straight to
-// disk regardless of this limit (see uploadsRouter.js's onUploadCreate);
+// Bounds how many trim+push-back-to-R2 pipelines run at once — NOT the
+// uploads. Every vendor's upload starts immediately and parts go straight
+// to R2 regardless of this limit (see multipartRouter.js's initUpload);
 // only the brief post-upload processing step queues here, so a burst of
 // concurrent finishes doesn't spawn an unbounded pile of ffmpeg processes
 // and OOM/disk-exhaust the instance.
