@@ -13,7 +13,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1097.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "express": "^5.2.1",
     "jose": "^6.2.2"
   },
   "devDependencies": {
